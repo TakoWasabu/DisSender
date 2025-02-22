@@ -174,7 +174,7 @@ def start_reaction():
 
 # GUI設定
 window = tk.Tk()
-window.title("sussyraider")
+window.title("DisRaider - By takowasabu")
 window.geometry("1100x400")
 
 frame_top = tk.Frame(window)
