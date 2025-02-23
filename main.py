@@ -1,69 +1,180 @@
-import tkinter as tk
-import threading
-from tkinter import filedialog, messagebox
-import requests
-import random
-import time
-import urllib.parse
+import dearpygui.dearpygui as dpg
+import threading, time, random, requests, urllib.parse, itertools, os
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+
+# ----------------------------
+# バックエンド処理（Tkinter 時代の処理を流用）
+# ----------------------------
 
 # グローバル変数
-token_list = []
+token_list = []                  # 現在有効なTokenリスト
+invalid_403_tokens = set()       # 403エラーで除外したToken
+token_file_path = None           # 選択されたTokenファイルのパス
+token_file_monitor_started = False  # Tokenファイル監視スレッドの起動フラグ
+fontdir= "./assets/font/font.ttf"
 
-def select_token_file():
-    global token_list
-    file_path = filedialog.askopenfilename(filetypes=[("Text Files", "*.txt")])
-    if file_path:
-        with open(file_path, "r", encoding="utf-8") as file:
+# 全体のレート制限（10分間10000件）
+message_timestamps = deque()     
+rate_lock = threading.Lock()
+
+# 各Tokenごとの1秒間の送信件数を管理する辞書
+token_rate_dict = {}
+
+# 最大10スレッドのプール（送信処理用）
+executor = ThreadPoolExecutor(max_workers=10)
+
+# Token ローテーション用イテレータ（select_token_file で更新）
+token_cycle = itertools.cycle(token_list)
+
+# 通報成功件数のカウント
+successful_count = 0
+count_lock = threading.Lock()
+custom_font = None
+
+# 通報先 URL（例）
+report_url = "https://discord.com/api/v9/reporting/message"
+
+def wait_for_token_rate_limit(token):
+    global token_rate_dict
+    while True:
+        now = time.time()
+        dq = token_rate_dict.setdefault(token, deque())
+        while dq and dq[0] < now - 1:
+            dq.popleft()
+        if len(dq) >= 49:
+            time.sleep(3)
+        else:
+            dq.append(now)
+            break
+
+def wait_for_rate_limit():
+    while True:
+        with rate_lock:
+            now = time.time()
+            while message_timestamps and message_timestamps[0] < now - 600:
+                message_timestamps.popleft()
+            if len(message_timestamps) < 10000:
+                message_timestamps.append(now)
+                return
+        time.sleep(1.5)
+
+def remove_token_from_file(token):
+    global token_file_path
+    try:
+        with open(token_file_path, "r", encoding="utf-8") as f:
+            tokens = f.read().splitlines()
+        tokens = [t.strip() for t in tokens if t.strip() and t.strip() != token]
+        with open(token_file_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(tokens))
+        print(f"Token {token[:15]} removed from file due to 401 error")
+    except Exception as e:
+        print(f"Error updating token file: {e}")
+
+def handle_token_error(token, status_code):
+    global token_list, invalid_403_tokens
+    if token in token_list:
+        token_list.remove(token)
+    if status_code == 401:
+        remove_token_from_file(token)
+        print(f"Token {token[:15]} removed (401)")
+    elif status_code == 403:
+        invalid_403_tokens.add(token)
+        print(f"Token {token[:15]} removed from active tokens (403)")
+
+def check_token_error(response, token):
+    if response.status_code == 401:
+        handle_token_error(token, 401)
+        return True
+    elif response.status_code == 403:
+        handle_token_error(token, 403)
+        return True
+    return False
+
+def monitor_token_file():
+    global token_list, token_file_path, invalid_403_tokens
+    while True:
+        if token_file_path:
+            try:
+                with open(token_file_path, "r", encoding="utf-8") as f:
+                    tokens = f.read().splitlines()
+                tokens = [t.strip() for t in tokens if t.strip()]
+                for token in tokens:
+                    if token not in token_list and token not in invalid_403_tokens:
+                        token_list.append(token)
+                        print(f"New token added: {token[:15]}...")
+            except Exception as e:
+                print("Error reading token file:", e)
+        time.sleep(10)
+
+def select_token_file_from_path(path):
+    global token_list, token_file_path, token_file_monitor_started, token_cycle
+    token_file_path = path
+    try:
+        with open(token_file_path, "r", encoding="utf-8") as file:
             tokens = [token.strip() for token in file.read().splitlines() if token.strip()]
-            if tokens:
-                token_list = tokens  # トークンリスト更新
-                entry_token.delete(0, tk.END)
-                entry_token.insert(0, tokens[0])  # 最初のトークンを表示
+        for token in tokens:
+            if token not in token_list:
+                token_list.append(token)
+        print("Token file loaded.")
+        token_cycle = itertools.cycle(token_list)
+        if not token_file_monitor_started:
+            threading.Thread(target=monitor_token_file, daemon=True).start()
+            token_file_monitor_started = True
+    except Exception as e:
+        print("Error reading token file:", e)
 
 def generate_bypass_string(length=4):
-    """bypass文字列をランダムで生成（アルファベット大文字と数字）"""
-    return ''.join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ123456789", k=length))
+    include_ranges = [(0x0000, 0xFFFF)]
+    alphabet = [chr(code_point) for current_range in include_ranges
+                for code_point in range(current_range[0], current_range[1] + 1)]
+    return "".join(random.sample(alphabet, length))
 
-def send_message(url, message, num_requests, bypass=False, mention_users=None, mention_count=0):
+def send_message(url, message, num_requests, bypass=False, vortex=False, wick=False, mention_users="", mention_count=0):
     def worker(token):
         headers = {"authorization": token}
-        mention_user_ids = mention_users.split("\n") if mention_users else []
-        
+        lines = mention_users.split("\n") if mention_users else []
         for _ in range(num_requests):
-            msg = message  # 毎回リセット
-            if bypass:
-                msg += f" {generate_bypass_string()}"  # リクエストごとに異なるbypassを追加
-            
-            if mention_users and mention_count > 0:
-                cnt = min(mention_count, len(mention_user_ids))
-                random_mentions = random.sample(mention_user_ids, cnt)
-                msg += " " + " ".join(f"<@!{uid.strip()}>" for uid in random_mentions)
-            
+            if wick:
+                msg = generate_bypass_string(random.randint(1, 30))
+            elif vortex:
+                msg = "".join(char + generate_bypass_string() for char in message)
+            elif bypass:
+                msg = message + " " + generate_bypass_string()
+            else:
+                msg = message
+            if not wick and lines and mention_count > 0:
+                cnt = min(mention_count, len(lines))
+                msg += " " + " ".join(f"<@!{uid.strip()}>" for uid in random.sample(lines, cnt))
             data = {"content": msg}
             try:
+                wait_for_token_rate_limit(token)
+                wait_for_rate_limit()
                 response = requests.post(url, headers=headers, json=data)
+                if check_token_error(response, token):
+                    continue
                 if response.status_code != 200:
-                    messagebox.showerror("エラー", f"メッセージ送信に失敗しました: {response.text}")
+                    print("エラー", f"メッセージ送信失敗: {response.text}")
                 else:
                     print(f"Message sent: {msg}")
             except Exception as e:
-                messagebox.showerror("エラー", f"メッセージ送信に失敗しました: {e}")
-            time.sleep(0.2)
-
-    for token in token_list:
-        threading.Thread(target=worker, args=(token,)).start()
+                print("エラー", f"メッセージ送信例外: {e}")
+            if wick:
+                time.sleep(random.uniform(3, 7))
+    for token in token_list.copy():
+        executor.submit(worker, token)
 
 def create_threads(url, thread_name, message, num_threads, bypass=False):
     def worker(token, thread_name):
         headers = {"authorization": token}
-        
         for _ in range(num_threads):
             tn = f"{thread_name} {generate_bypass_string()}" if bypass else thread_name
             data = {"name": tn, "type": 11, "auto_archive_duration": 60}
             try:
+                wait_for_token_rate_limit(token)
                 response = requests.post(url, headers=headers, json=data)
-                
-                # レート制限チェック
+                if check_token_error(response, token):
+                    continue
                 if response.status_code == 429:
                     retry_after = response.json().get("retry_after", 1)
                     print(f"レート制限: {retry_after}秒待機")
@@ -73,207 +184,284 @@ def create_threads(url, thread_name, message, num_threads, bypass=False):
                     thread_id = response.json().get("id")
                     send_message(f"https://discord.com/api/v9/channels/{thread_id}/messages", message, 1, bypass)
                 else:
-                    messagebox.showerror("エラー", f"スレッド作成に失敗しました: {response.text}")
+                    print("エラー", f"スレッド作成失敗: {response.text}")
             except Exception as e:
-                messagebox.showerror("エラー", f"スレッド作成に失敗しました: {e}")
-            time.sleep(0.5)
-
-    for token in token_list:
-        threading.Thread(target=worker, args=(token, thread_name)).start()
+                print("エラー", f"スレッド作成例外: {e}")
+    for token in token_list.copy():
+        executor.submit(worker, token, thread_name)
 
 def set_tokens_online():
     url = "https://discord.com/api/v9/users/@me/settings"
     data = {"status": "online"}
-    for token in token_list:
+    def worker(token):
         headers = {"authorization": token, "Content-Type": "application/json"}
         try:
+            wait_for_token_rate_limit(token)
             response = requests.patch(url, headers=headers, json=data)
+            if check_token_error(response, token):
+                return
             if response.status_code in (200, 204):
-                print(f"Token {token[:5]}... onlineに設定")
+                print(f"Token {token[:15]}... onlineに設定")
             else:
-                print(f"Token {token[:5]}... online設定失敗: {response.text}")
+                print(f"Token {token[:15]}... online設定失敗: {response.text}")
         except Exception as e:
-            print(f"Token {token[:5]}... online設定エラー: {e}")
-        time.sleep(0.5)
+            print(f"Token {token[:15]}... online設定例外: {e}")
+    for token in token_list.copy():
+        executor.submit(worker, token)
 
-def send_typing_indicator(channel_id):
+def send_typing_indicator_single(channel_id, token):
     url = f"https://discord.com/api/v9/channels/{channel_id}/typing"
-    for token in token_list:
-        headers = {"authorization": token}
-        try:
-            response = requests.post(url, headers=headers)
-            if response.status_code == 204:
-                print(f"Token {token[:5]}... typing sent in {channel_id}")
-            else:
-                print(f"Token {token[:5]}... typing送信失敗: {response.text}")
-        except Exception as e:
-            print(f"Token {token[:5]}... typing送信エラー: {e}")
-        time.sleep(0.2)
+    headers = {"authorization": token}
+    try:
+        wait_for_token_rate_limit(token)
+        response = requests.post(url, headers=headers)
+        if check_token_error(response, token):
+            return
+        if response.status_code == 204:
+            print(f"Token {token[:15]}... typing送信成功 in {channel_id}")
+        else:
+            print(f"Token {token[:15]}... typing送信失敗: {response.text}")
+    except Exception as e:
+        print(f"Token {token[:15]}... typing送信例外: {e}")
+
+def continuous_typing(channel_id):
+    tokens_to_use = token_list if len(token_list) <= 10 else token_list[:10]
+    while dpg.does_item_exist("MainWindow"):
+        for token in tokens_to_use.copy():
+            executor.submit(send_typing_indicator_single, channel_id, token)
+        time.sleep(2)
 
 def add_reaction(channel_id, message_id, emoji):
-    """
-    指定したチャンネル・メッセージに対して、全tokenでリアクションを追加する。
-    emojiはURLエンコードして送信。
-    """
     encoded_emoji = urllib.parse.quote(emoji, safe='')
     url = f"https://discord.com/api/v9/channels/{channel_id}/messages/{message_id}/reactions/{encoded_emoji}/@me"
-    for token in token_list:
+    def worker(token):
         headers = {"authorization": token}
         try:
+            wait_for_token_rate_limit(token)
             response = requests.put(url, headers=headers)
+            if check_token_error(response, token):
+                return
             if response.status_code == 204:
-                print(f"Token {token[:5]}... reaction '{emoji}' added")
+                print(f"Token {token[:15]}... reaction '{emoji}' added")
             else:
-                print(f"Token {token[:5]}... reaction追加失敗: {response.text}")
+                print(f"Token {token[:15]}... reaction追加失敗: {response.text}")
         except Exception as e:
-            print(f"Token {token[:5]}... reaction追加エラー: {e}")
-        time.sleep(0.2)
+            print(f"Token {token[:15]}... reaction追加例外: {e}")
+    for token in token_list.copy():
+        executor.submit(worker, token)
 
-def start_action(action_type, bypass_message=False, bypass_thread=False):
-    if not token_list:
-        messagebox.showerror("エラー", "トークンを選択してください。")
-        return
-    
-    channel_id = entry_channel.get().strip()
-    mention_users = entry_mentions.get()
-    
+def send_report(msgid, channel, target_success, bypass=False):
+    global successful_count
+    token = next(token_cycle)
+    payload = {
+        "version": "1.0",
+        "variant": "6",
+        "language": "en",
+        "breadcrumbs": [3, 57, 83],
+        "elements": {},
+        "channel_id": channel,
+        "message_id": msgid,
+        "name": "message"
+    }
+    headers = {
+        "Authorization": token,
+        "User-Agent": "Mozilla/5.0",
+        "Content-Type": "application/json"
+    }
     try:
-        mention_count = int(entry_mention_count.get())
+        response = requests.post(report_url, json=payload, headers=headers)
+        if response.status_code == 200:
+            with count_lock:
+                successful_count += 1
+                print(f"Success: {successful_count}/{target_success}")
+        else:
+            print(f"Failure: Status Code: {response.status_code}")
+    except Exception as e:
+        print(f"Error: {e}")
+
+def report_action():
+    msgid = dpg.get_value("report_message_id")
+    channel = dpg.get_value("report_channel_id")
+    try:
+        target_success = int(dpg.get_value("target_success_input"))
+    except:
+        target_success = 0
+    global successful_count
+    successful_count = 0
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futures = set()
+        from concurrent.futures import wait, FIRST_COMPLETED
+        while successful_count < target_success:
+            while len(futures) < 3 and successful_count < target_success:
+                futures.add(ex.submit(send_report, msgid, channel, target_success, False))
+            done, futures = wait(futures, return_when=FIRST_COMPLETED)
+
+def start_action(action_type, bypass_message=False, vortex=False, wick=False, bypass_thread=False):
+    if not token_list:
+        print("エラー: トークンが読み込まれていません。")
+        return
+    channel_id = dpg.get_value("channel_id_input")
+    mention_users = dpg.get_value("mention_ids_input")
+    try:
+        mention_count = int(dpg.get_value("mention_count_input"))
     except ValueError:
         mention_count = 0
-    
     if action_type == "message":
         url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
-        threading.Thread(target=send_message, args=(
-            url,
-            entry_message.get(),
-            int(entry_num_messages.get()),
-            bypass_message,
-            mention_users,
-            mention_count
-        )).start()
-
+        send_message(url, dpg.get_value("message_input"), int(dpg.get_value("num_messages_input")),
+                     bypass_message, vortex, wick, mention_users, mention_count)
     elif action_type == "thread":
         url = f"https://discord.com/api/v9/channels/{channel_id}/threads"
-        threading.Thread(target=create_threads, args=(
-            url,
-            entry_thread_name.get(),
-            entry_thread_message.get(),
-            int(entry_num_threads.get()),
-            bypass_thread
-        )).start()
+        create_threads(url, dpg.get_value("thread_name_input"), dpg.get_value("thread_message_input"),
+                       int(dpg.get_value("num_threads_input")), bypass_thread)
 
 def start_reaction():
-    channel_id = entry_channel.get().strip()
-    message_id = entry_message_id.get().strip()
-    emoji = entry_emoji.get().strip()
+    channel_id = dpg.get_value("channel_id_input")
+    message_id = dpg.get_value("reaction_message_id")
+    emoji = dpg.get_value("emoji_input")
     if not channel_id or not message_id or not emoji:
-        messagebox.showerror("エラー", "チャンネルID、メッセージID、絵文字を入力してください。")
+        print("エラー: 必要な情報が入力されていません。")
         return
-    threading.Thread(target=add_reaction, args=(channel_id, message_id, emoji)).start()
+    add_reaction(channel_id, message_id, emoji)
 
-# GUI設定
-window = tk.Tk()
-window.title("DisRaider - By takowasabu")
-window.geometry("1100x400")
+# ----------------------------
+# Settings の実装
+# ----------------------------
+def apply_settings_callback(sender, app_data, user_data):
+    # カラーピッカーは0.0～1.0の値を返すため、0～255に変換
+    bg_color = dpg.get_value("bg_color_picker")  # 例: [r, g, b, a]
+    text_color = dpg.get_value("text_color_picker")
+    transparency = dpg.get_value("transparency_slider")
+    bg = (int(bg_color[0]*255), int(bg_color[1]*255), int(bg_color[2]*255), int(transparency*255))
+    txt = (int(text_color[0]*255), int(text_color[1]*255), int(text_color[2]*255), 255)
+    with dpg.theme() as custom_theme:
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_color(dpg.mvThemeCol_WindowBg, bg)
+            dpg.add_theme_color(dpg.mvThemeCol_Text, txt)
+    dpg.bind_theme(custom_theme)
+    print("Settings applied.")
 
-frame_top = tk.Frame(window)
-frame_top.pack(fill="x", padx=10, pady=5)
+# ----------------------------
+# DearPyGui GUI 部分
+# ----------------------------
 
-label_token = tk.Label(frame_top, text="Token:")
-label_token.pack(side="left")
-entry_token = tk.Entry(frame_top, width=40)
-entry_token.pack(side="left")
-button_select_token = tk.Button(frame_top, text="Select Token File", command=select_token_file)
-button_select_token.pack(side="left", padx=5)
+dpg.create_context()
 
-label_channel = tk.Label(frame_top, text="Channel ID:")
-label_channel.pack(side="left", padx=10)
-entry_channel = tk.Entry(frame_top, width=20)
-entry_channel.pack(side="left")
+with dpg.font_registry():
+    with dpg.font(fontdir, 20):
 
-button_online = tk.Button(frame_top, text="Set All Online", command=lambda: threading.Thread(target=set_tokens_online).start())
-button_online.pack(side="left", padx=5)
+        # add the default font range
+        dpg.add_font_range_hint(dpg.mvFontRangeHint_Default)
+        dpg.add_font_range_hint(dpg.mvFontRangeHint_Japanese)
 
-button_typing = tk.Button(frame_top, text="Send Typing", command=lambda: threading.Thread(target=send_typing_indicator, args=(entry_channel.get().strip(),)).start())
-button_typing.pack(side="left", padx=5)
+        # add specific range of glyphs
+        dpg.add_font_range(0x3100, 0x3ff0)
 
-frame_main = tk.Frame(window)
-frame_main.pack(padx=10, pady=10, fill="both", expand=True)
+        # add specific glyphs
+        dpg.add_font_chars([0x3105, 0x3107, 0x3108])
 
-# メッセージ送信フレーム
-frame_message = tk.LabelFrame(frame_main, text="メッセージ送信", padx=5, pady=5)
-frame_message.pack(side="left", padx=5, pady=5, fill="both", expand=True)
+        # remap や to %
+        dpg.add_char_remap(0x3084, 0x0025)
 
-label_message = tk.Label(frame_message, text="Message:")
-label_message.pack()
-entry_message = tk.Entry(frame_message, width=40)
-entry_message.pack()
+#with dpg.font_registry():
+#    custom_font = dpg.add_font(fontdir, 20)
+#    dpg.bind_font(custom_font)
 
-label_num_messages = tk.Label(frame_message, text="Number of Messages:")
-label_num_messages.pack()
-entry_num_messages = tk.Entry(frame_message, width=20)
-entry_num_messages.pack()
+# ファイルダイアログ（Tokenファイル選択用）
+with dpg.file_dialog(directory_selector=False, show=False, callback=lambda s, a, u: select_token_file_from_path(a["file_path_name"]), tag="file_dialog_id"):
+    dpg.add_file_extension(".txt", color=[255,255,0])
 
-label_mentions = tk.Label(frame_message, text="Mention User IDs (newline-separated):")
-label_mentions.pack()
-entry_mentions = tk.Entry(frame_message, width=40)
-entry_mentions.pack()
+# メニューのページ切り替えコールバック
+def show_page(page_tag):
+    for tag in ["MeinMenu", "ChatSender", "Reaction", "Thread", "Report", "Settings"]:
+        dpg.configure_item(tag, show=False)
+    dpg.configure_item(page_tag, show=True)
 
-label_mention_count = tk.Label(frame_message, text="Number of Mentions:")
-label_mention_count.pack()
-entry_mention_count = tk.Entry(frame_message, width=20)
-entry_mention_count.pack()
+# Wick mode の場合に Message 入力欄の有効無効を更新するコールバック
+def update_message_field_state_dpg(sender, app_data, user_data):
+    if dpg.get_value("wick_checkbox"):
+        dpg.configure_item("message_input", enabled=False)
+    else:
+        dpg.configure_item("message_input", enabled=True)
 
-bypass_message = tk.BooleanVar()
-bypass_button_message = tk.Checkbutton(frame_message, text="bypassを追加", variable=bypass_message)
-bypass_button_message.pack()
+# メインウィンドウ
+with dpg.window(label="DisRaider - By takowasabu & yutodadil", tag="MainWindow", width=1100, height=700):
+    with dpg.group(horizontal=True):
+        # 左側のメニュー
+        with dpg.child_window(width=200, tag="menu_window"):
+            dpg.add_text("Menu")
+            dpg.add_separator()
+            dpg.add_button(label="MeinMenu", callback=lambda: show_page("MeinMenu"))
+            dpg.add_button(label="Chat Sender", callback=lambda: show_page("ChatSender"))
+            dpg.add_button(label="Reaction", callback=lambda: show_page("Reaction"))
+            dpg.add_button(label="Thread", callback=lambda: show_page("Thread"))
+            dpg.add_button(label="Report", callback=lambda: show_page("Report"))
+            dpg.add_button(label="Settings", callback=lambda: show_page("Settings"))
+        # 右側のコンテンツ領域
+        with dpg.child_window(tag="main_content", border=False):
+            # MeinMenu ページ
+            with dpg.group(tag="MeinMenu", show=True):
+                dpg.add_text("MeinMenu")
+                dpg.add_button(label="Select Token File", callback=lambda: dpg.show_item("file_dialog_id"))
+                dpg.add_input_text(label="Channel ID", tag="channel_id_input")
+                dpg.add_button(label="Set All Online", callback=lambda: executor.submit(set_tokens_online))
+            # Chat Sender ページ
+            with dpg.group(tag="ChatSender", show=False):
+                dpg.add_text("Chat Sender")
+                dpg.add_input_text(label="Message", tag="message_input", width=400)
+                dpg.add_input_text(label="Number of Messages", tag="num_messages_input", default_value="1")
+                dpg.add_input_text(label="Mention User IDs (newline separated)", tag="mention_ids_input", multiline=True, width=400)
+                dpg.add_input_text(label="Number of Mentions", tag="mention_count_input", default_value="0")
+                dpg.add_checkbox(label="bypass", tag="bypass_checkbox")
+                dpg.add_checkbox(label="Vortex mode", tag="vortex_checkbox")
+                dpg.add_checkbox(label="Wick mode", tag="wick_checkbox", callback=update_message_field_state_dpg)
+                dpg.add_button(label="Run", callback=lambda: executor.submit(
+                    start_action, "message",
+                    dpg.get_value("bypass_checkbox"),
+                    dpg.get_value("vortex_checkbox"),
+                    dpg.get_value("wick_checkbox"),
+                    False
+                ))
+                dpg.add_button(label="Send Typing Continuously", callback=lambda: threading.Thread(
+                    target=continuous_typing,
+                    args=(dpg.get_value("channel_id_input"),),
+                    daemon=True
+                ).start())
+            # Reaction ページ
+            with dpg.group(tag="Reaction", show=False):
+                dpg.add_text("Reaction")
+                dpg.add_input_text(label="Message ID", tag="reaction_message_id", width=400)
+                dpg.add_input_text(label="Emoji", tag="emoji_input", width=100)
+                dpg.add_button(label="Add Reaction", callback=lambda: start_reaction())
+            # Thread ページ
+            with dpg.group(tag="Thread", show=False):
+                dpg.add_text("Thread")
+                dpg.add_input_text(label="Thread Name", tag="thread_name_input", width=400)
+                dpg.add_input_text(label="Thread Message", tag="thread_message_input", width=400)
+                dpg.add_input_text(label="Number of Threads", tag="num_threads_input", default_value="1")
+                dpg.add_checkbox(label="bypass", tag="thread_bypass_checkbox")
+                dpg.add_button(label="Run", callback=lambda: executor.submit(
+                    start_action, "thread",
+                    False, False, False, dpg.get_value("thread_bypass_checkbox")
+                ))
+            # Report ページ
+            with dpg.group(tag="Report", show=False):
+                dpg.add_text("Report")
+                dpg.add_input_text(label="Message ID", tag="report_message_id", width=400)
+                dpg.add_input_text(label="Channel ID", tag="report_channel_id", width=400,)
+                dpg.add_input_text(label="Target Success Count", tag="target_success_input", default_value="10")
+                dpg.add_button(label="Run", callback=lambda: report_action())
+            # Settings ページ（設定の適用）
+            with dpg.group(tag="Settings", show=False):
+                dpg.add_text("Settings")
+                with dpg.group(horizontal=True):
+                    dpg.add_color_picker(label="Background", tag="bg_color_picker", width=150, height=150, no_side_preview=True, no_small_preview=False, default_value=[0.1, 0.1, 0.1, 1.0])
+                    dpg.add_color_picker(label="Text", tag="text_color_picker", width=150, height=150, no_side_preview=True, no_small_preview=False, default_value=[1.0, 1.0, 1.0, 1.0])
+                dpg.add_slider_float(label="Transparency", tag="transparency_slider", default_value=1.0, min_value=0.0, max_value=1.0)
+                dpg.add_button(label="Apply Settings", callback=apply_settings_callback)
 
-button_send_message = tk.Button(frame_message, text="実行", command=lambda: start_action("message", bypass_message.get(), False))
-button_send_message.pack()
-
-# リアクション追加フレーム
-frame_reaction = tk.LabelFrame(frame_main, text="リアクション追加", padx=5, pady=5)
-frame_reaction.pack(side="left", padx=5, pady=5, fill="both", expand=True)
-
-label_message_id = tk.Label(frame_reaction, text="Message ID:")
-label_message_id.pack()
-entry_message_id = tk.Entry(frame_reaction, width=30)
-entry_message_id.pack()
-
-label_emoji = tk.Label(frame_reaction, text="Emoji:")
-label_emoji.pack()
-entry_emoji = tk.Entry(frame_reaction, width=10)
-entry_emoji.pack()
-
-button_reaction = tk.Button(frame_reaction, text="リアクション追加", command=start_reaction)
-button_reaction.pack(pady=5)
-
-# スレッド作成フレーム
-frame_thread = tk.LabelFrame(frame_main, text="スレッド作成", padx=5, pady=5)
-frame_thread.pack(side="left", padx=5, pady=5, fill="both", expand=True)
-
-label_thread_name = tk.Label(frame_thread, text="Thread Name:")
-label_thread_name.pack()
-entry_thread_name = tk.Entry(frame_thread, width=40)
-entry_thread_name.pack()
-
-label_thread_message = tk.Label(frame_thread, text="Thread Message:")
-label_thread_message.pack()
-entry_thread_message = tk.Entry(frame_thread, width=40)
-entry_thread_message.pack()
-
-label_num_threads = tk.Label(frame_thread, text="Number of Threads:")
-label_num_threads.pack()
-entry_num_threads = tk.Entry(frame_thread, width=20)
-entry_num_threads.pack()
-
-bypass_thread = tk.BooleanVar()
-bypass_button_thread = tk.Checkbutton(frame_thread, text="bypassを追加", variable=bypass_thread)
-bypass_button_thread.pack()
-
-button_create_thread = tk.Button(frame_thread, text="実行", command=lambda: start_action("thread", False, bypass_thread.get()))
-button_create_thread.pack()
-
-window.mainloop()
-
+dpg.create_viewport(title="DisRaider - By takowasabu", width=1100, height=400)
+dpg.setup_dearpygui()
+dpg.show_viewport()
+dpg.start_dearpygui()
+dpg.destroy_context()
