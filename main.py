@@ -128,7 +128,10 @@ def generate_bypass_string(length=4):
     include_ranges = [(0x0000, 0xFFFF)]
     alphabet = [chr(code_point) for current_range in include_ranges
                 for code_point in range(current_range[0], current_range[1] + 1)]
-    return "".join(random.sample(alphabet, length))
+    generated = "".join(random.sample(alphabet, length))
+    result = generated.encode("utf-8", "replace")
+    result = result.decode('utf-8')
+    return result
 
 def send_message(url, message, num_requests, bypass=False, vortex=False, wick=False, mention_users="", mention_count=0):
     def worker(token):
