@@ -22,7 +22,7 @@ rate_lock = threading.Lock()
 token_rate_dict = {}
 
 # 最大10スレッドのプール（送信処理用）
-executor = ThreadPoolExecutor(max_workers=10)
+executor = ThreadPoolExecutor(max_workers=25)
 
 # Token ローテーション用イテレータ（select_token_file で更新）
 token_cycle = itertools.cycle(token_list)
@@ -136,16 +136,25 @@ def generate_bypass_string(length=4):
 def send_message(url, message, num_requests, bypass=False, vortex=False, wick=False, mention_users="", mention_count=0):
     def worker(token):
         headers = {"authorization": token}
+        # もしメンション指定があれば改行で分割
         lines = mention_users.split("\n") if mention_users else []
+        counter = 0  # Wick mode用のメッセージカウンタ
         for _ in range(num_requests):
+            counter += 1
             if wick:
+                # 基本メッセージはランダムな長さのbypass文字列
                 msg = generate_bypass_string(random.randint(1, 30))
+                # 3メッセージに1回、40%の確率でメンションを追加する
+                if counter % 3 == 0 and lines and random.random() < 0.4:
+                    cnt = min(mention_count, len(lines)) if mention_count > 0 else 1
+                    msg += " " + " ".join(f"<@!{uid.strip()}>" for uid in random.sample(lines, cnt))
             elif vortex:
                 msg = "".join(char + generate_bypass_string() for char in message)
             elif bypass:
                 msg = message + " " + generate_bypass_string()
             else:
                 msg = message
+            # 非Wickモードの場合は通常のメンション処理
             if not wick and lines and mention_count > 0:
                 cnt = min(mention_count, len(lines))
                 msg += " " + " ".join(f"<@!{uid.strip()}>" for uid in random.sample(lines, cnt))
@@ -236,7 +245,7 @@ def continuous_typing(channel_id):
 
 def add_reaction(channel_id, message_id, emoji):
     encoded_emoji = urllib.parse.quote(emoji, safe='')
-    url = f"https://discord.com/api/v9/channels/{channel_id}/messages/{message_id}/reactions/{encoded_emoji}/@me"
+    url = f"https://discord.com/api/v9/channels/{channel_id}/messages/{message_id}/reactions/{encoded_emoji}/@me?location=Message Hover Bar&type=0"
     def worker(token):
         headers = {"authorization": token}
         try:
@@ -260,7 +269,7 @@ def send_report(msgid, channel, target_success, bypass=False):
         "version": "1.0",
         "variant": "6",
         "language": "en",
-        "breadcrumbs": [3, 57, 83],
+        "breadcrumbs": [3, 61, 71, 106],
         "elements": {},
         "channel_id": channel,
         "message_id": msgid,
@@ -272,7 +281,12 @@ def send_report(msgid, channel, target_success, bypass=False):
         "Content-Type": "application/json"
     }
     try:
+        # Report用にも各Tokenごとのレート制限および全体のレート制限を適用
+        wait_for_token_rate_limit(token)
+        wait_for_rate_limit()
         response = requests.post(report_url, json=payload, headers=headers)
+        if check_token_error(response, token):
+            return
         if response.status_code == 200:
             with count_lock:
                 successful_count += 1
@@ -463,7 +477,7 @@ with dpg.window(label="DisRaider - By takowasabu & yutodadil", tag="MainWindow",
                 dpg.add_slider_float(label="Transparency", tag="transparency_slider", default_value=1.0, min_value=0.0, max_value=1.0)
                 dpg.add_button(label="Apply Settings", callback=apply_settings_callback)
 
-dpg.create_viewport(title="DisRaider - By takowasabu", width=1100, height=400)
+dpg.create_viewport(title="DisRaider - By takowasabu & yutodadil", width=1100, height=400)
 dpg.setup_dearpygui()
 dpg.show_viewport()
 dpg.start_dearpygui()
